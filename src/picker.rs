@@ -8,37 +8,62 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const RECENT: usize = 5;
-/// Env choices in the add form; `auto` leaves `env` unset so localhost and files become `local`.
-pub const ENVS: [&str; 3] = ["auto", "test", "prod"];
-const ENV_ORDER: [&str; 4] = ["local", "test", "prod", "other"];
+const LAST_OPENED: usize = 5;
+const LABEL_ORDER: [&str; 3] = ["local", "test", "prod"];
+pub const MENU: [&str; 3] = ["Edit", "Copy connection string", "Remove"];
 
+/// Date is the order of `config.toml`: new connections are appended.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Sort {
-    LastUsed,
-    Name,
-    Kind,
+    Newest,
+    Oldest,
+    NameAsc,
+    NameDesc,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Grouping {
-    Env,
+    Label,
     Kind,
+    None,
 }
 
 #[derive(Debug, PartialEq)]
 pub enum ListRow {
-    Header(String, usize),
+    LastOpened(usize),
+    Group(String),
     Entry(usize),
 }
 
 #[derive(Debug, Default)]
 pub struct Form {
-    /// 0 name, 1 url, 2 env.
+    /// 0 name, 1 url, 2 label.
     pub field: usize,
     pub name: String,
     pub url: String,
-    pub env: usize,
+    pub label: String,
+    /// The connection being edited; `None` adds a new one.
+    pub editing: Option<usize>,
+}
+
+impl Form {
+    fn edit(connection: &Connection, i: usize) -> Form {
+        Form {
+            field: 0,
+            name: connection.name.clone(),
+            url: connection.url.clone(),
+            label: connection.label.clone().unwrap_or_default(),
+            editing: Some(i),
+        }
+    }
+
+    fn text(&mut self) -> &mut String {
+        match self.field {
+            0 => &mut self.name,
+            1 => &mut self.url,
+            _ => &mut self.label,
+        }
+    }
 }
 
 pub struct Picker {
@@ -49,10 +74,12 @@ pub struct Picker {
     pub grouping: Grouping,
     pub filter: String,
     pub filtering: bool,
-    /// Index among the `ListRow::Entry` rows, headers are skipped.
+    /// Index among the connection rows, group headers are skipped.
     pub cursor: usize,
     pub form: Option<Form>,
-    /// The connection waiting for `y` to confirm its deletion.
+    /// The selected item of the open `MENU`.
+    pub menu: Option<usize>,
+    /// The connection waiting for `y` to confirm its removal.
     pub deleting: Option<usize>,
 }
 
@@ -68,39 +95,41 @@ impl Picker {
             dir,
             connections,
             recent,
-            sort: Sort::LastUsed,
-            grouping: Grouping::Env,
+            sort: Sort::Newest,
+            grouping: Grouping::Label,
             filter: String::new(),
             filtering: false,
             cursor: 0,
             form: None,
+            menu: None,
             deleting: None,
         }
     }
 
-    /// Recent first (hidden while filtering), then one section per group.
+    /// Last opened first (hidden while filtering), then the connections, grouped unless `Grouping::None`.
     pub fn rows(&self) -> Vec<ListRow> {
         let mut matching: Vec<usize> = (0..self.connections.len()).filter(|&i| self.matches(i)).collect();
         matching.sort_by(|&a, &b| self.compare(a, b));
 
         let mut rows = Vec::new();
         if self.filter.is_empty() {
-            let mut recent: Vec<usize> = matching.iter().copied().filter(|&i| self.last_used(i).is_some()).collect();
-            recent.sort_by_key(|&i| Reverse(self.last_used(i)));
-            recent.truncate(RECENT);
-            if !recent.is_empty() {
-                rows.push(ListRow::Header("Recent".into(), recent.len()));
-                rows.extend(recent.into_iter().map(ListRow::Entry));
-            }
+            let mut opened: Vec<usize> = matching.iter().copied().filter(|&i| self.last_used(i).is_some()).collect();
+            opened.sort_by_key(|&i| Reverse(self.last_used(i)));
+            opened.truncate(LAST_OPENED);
+            rows.extend(opened.into_iter().map(ListRow::LastOpened));
+        }
+        if self.grouping == Grouping::None {
+            rows.extend(matching.into_iter().map(ListRow::Entry));
+            return rows;
         }
 
         let mut groups: Vec<String> = matching.iter().map(|&i| self.group_of(i)).collect();
-        groups.sort_by_key(|group| (group_rank(self.grouping, group), group.clone()));
+        groups.sort_by_key(|group| (label_rank(self.grouping, group), group.clone()));
         groups.dedup();
         for group in groups {
-            let members: Vec<usize> = matching.iter().copied().filter(|&i| self.group_of(i) == group).collect();
-            rows.push(ListRow::Header(group, members.len()));
-            rows.extend(members.into_iter().map(ListRow::Entry));
+            let members = matching.iter().copied().filter(|&i| self.group_of(i) == group);
+            rows.push(ListRow::Group(group.clone()));
+            rows.extend(members.map(ListRow::Entry));
         }
         rows
     }
@@ -109,44 +138,50 @@ impl Picker {
         self.recent.get(&self.connections[i].name).copied()
     }
 
+    /// The connection under the cursor.
+    pub fn selected(&self) -> Option<usize> {
+        self.entries().get(self.cursor).copied()
+    }
+
     fn group_of(&self, i: usize) -> String {
         let connection = &self.connections[i];
         match self.grouping {
-            Grouping::Env => connection.env().to_string(),
+            Grouping::Label => connection.label().to_string(),
             Grouping::Kind => connection.kind(),
+            Grouping::None => String::new(),
         }
     }
 
     fn matches(&self, i: usize) -> bool {
         let needle = self.filter.to_lowercase();
         let connection = &self.connections[i];
-        let fields = [connection.name.clone(), connection.env().to_string(), connection.kind(), connection.redacted_url()];
+        let fields = [connection.name.clone(), connection.label().to_string(), connection.kind(), connection.redacted_url()];
         fields.iter().any(|field| field.to_lowercase().contains(&needle))
     }
 
     fn compare(&self, a: usize, b: usize) -> std::cmp::Ordering {
         let name = |i: usize| self.connections[i].name.to_lowercase();
         match self.sort {
-            Sort::LastUsed => self.last_used(b).cmp(&self.last_used(a)).then_with(|| name(a).cmp(&name(b))),
-            Sort::Name => name(a).cmp(&name(b)),
-            Sort::Kind => self.connections[a].kind().cmp(&self.connections[b].kind()).then_with(|| name(a).cmp(&name(b))),
+            Sort::Newest => b.cmp(&a),
+            Sort::Oldest => a.cmp(&b),
+            Sort::NameAsc => name(a).cmp(&name(b)),
+            Sort::NameDesc => name(b).cmp(&name(a)),
         }
     }
 
     fn entries(&self) -> Vec<usize> {
-        let rows = self.rows();
         let mut entries = Vec::new();
-        for row in rows {
-            if let ListRow::Entry(i) = row {
+        for row in self.rows() {
+            if let ListRow::LastOpened(i) | ListRow::Entry(i) = row {
                 entries.push(i);
             }
         }
         entries
     }
 
-    /// Letters go into a text field or a y/n prompt instead of being commands.
+    /// Letters go into a text field, the menu or a y/n prompt instead of being commands.
     pub fn is_typing(&self) -> bool {
-        self.filtering || self.form.is_some() || self.deleting.is_some()
+        self.filtering || self.form.is_some() || self.menu.is_some() || self.deleting.is_some()
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Result<Action> {
@@ -155,6 +190,9 @@ impl Picker {
                 self.delete(i)?;
             }
             return Ok(Action::None);
+        }
+        if let Some(item) = self.menu {
+            return self.menu_key(key, item);
         }
         if self.form.is_some() {
             return self.form_key(key);
@@ -187,19 +225,23 @@ impl Picker {
             KeyCode::Char('j') | KeyCode::Down => self.move_cursor(1),
             KeyCode::Char('k') | KeyCode::Up => self.move_cursor(-1),
             KeyCode::Char('/') => self.filtering = true,
-            KeyCode::Char('a') => self.form = Some(Form::default()),
-            KeyCode::Char('d') => self.deleting = self.entries().get(self.cursor).copied(),
+            KeyCode::Char('n') => self.form = Some(Form::default()),
+            KeyCode::Char('m' | '.') if self.selected().is_some() => self.menu = Some(0),
+            KeyCode::Char('d') => self.deleting = self.selected(),
+            KeyCode::Char('x') => self.forget()?,
             KeyCode::Char('s') => {
                 self.sort = match self.sort {
-                    Sort::LastUsed => Sort::Name,
-                    Sort::Name => Sort::Kind,
-                    Sort::Kind => Sort::LastUsed,
+                    Sort::Newest => Sort::Oldest,
+                    Sort::Oldest => Sort::NameAsc,
+                    Sort::NameAsc => Sort::NameDesc,
+                    Sort::NameDesc => Sort::Newest,
                 }
             }
             KeyCode::Char('g') => {
                 self.grouping = match self.grouping {
-                    Grouping::Env => Grouping::Kind,
-                    Grouping::Kind => Grouping::Env,
+                    Grouping::Label => Grouping::Kind,
+                    Grouping::Kind => Grouping::None,
+                    Grouping::None => Grouping::Label,
                 }
             }
             KeyCode::Enter => return self.open(),
@@ -214,6 +256,7 @@ impl Picker {
         self.filtering = true;
         self.cursor = 0;
         self.form = None;
+        self.menu = None;
     }
 
     fn move_cursor(&mut self, delta: isize) {
@@ -221,12 +264,40 @@ impl Picker {
     }
 
     fn open(&mut self) -> Result<Action> {
-        let Some(&i) = self.entries().get(self.cursor) else { return Ok(Action::None) };
+        let Some(i) = self.selected() else { return Ok(Action::None) };
         let connection = &self.connections[i];
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
         self.recent.insert(connection.name.clone(), now);
         config::save_recent(&self.dir, &self.recent)?;
         Ok(Action::Connect(connection.url.clone()))
+    }
+
+    fn forget(&mut self) -> Result<()> {
+        let Some(i) = self.selected() else { return Ok(()) };
+        if self.recent.remove(&self.connections[i].name).is_some() {
+            config::save_recent(&self.dir, &self.recent)?;
+        }
+        self.cursor = self.cursor.min(self.entries().len().saturating_sub(1));
+        Ok(())
+    }
+
+    fn menu_key(&mut self, key: KeyEvent, item: usize) -> Result<Action> {
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => self.menu = Some(step(item, 1, MENU.len())),
+            KeyCode::Char('k') | KeyCode::Up => self.menu = Some(step(item, -1, MENU.len())),
+            KeyCode::Enter => {
+                self.menu = None;
+                let Some(i) = self.selected() else { return Ok(Action::None) };
+                match item {
+                    0 => self.form = Some(Form::edit(&self.connections[i], i)),
+                    1 => return Ok(Action::Copy(self.connections[i].url.clone())),
+                    _ => self.deleting = Some(i),
+                }
+            }
+            KeyCode::Esc | KeyCode::Char('q' | 'm' | '.') => self.menu = None,
+            _ => {}
+        }
+        Ok(Action::None)
     }
 
     fn delete(&mut self, i: usize) -> Result<()> {
@@ -245,44 +316,57 @@ impl Picker {
         let Some(form) = &mut self.form else { return Ok(Action::None) };
         match key.code {
             KeyCode::Esc => self.form = None,
-            KeyCode::Enter => return self.save(),
+            KeyCode::Enter => self.save()?,
             KeyCode::Tab | KeyCode::Down => form.field = (form.field + 1) % 3,
             KeyCode::BackTab | KeyCode::Up => form.field = (form.field + 2) % 3,
-            KeyCode::Right | KeyCode::Char(' ') if form.field == 2 => form.env = (form.env + 1) % ENVS.len(),
-            KeyCode::Left if form.field == 2 => form.env = (form.env + ENVS.len() - 1) % ENVS.len(),
-            KeyCode::Backspace if form.field == 0 => _ = form.name.pop(),
-            KeyCode::Backspace if form.field == 1 => _ = form.url.pop(),
-            KeyCode::Char(c) if form.field == 0 => form.name.push(c),
-            KeyCode::Char(c) if form.field == 1 => form.url.push(c),
+            KeyCode::Backspace => _ = form.text().pop(),
+            KeyCode::Char(c) => form.text().push(c),
             _ => {}
         }
         Ok(Action::None)
     }
 
-    fn save(&mut self) -> Result<Action> {
-        let Some(form) = &self.form else { return Ok(Action::None) };
-        let (name, url) = (form.name.trim(), form.url.trim());
+    fn save(&mut self) -> Result<()> {
+        let Some(form) = &self.form else { return Ok(()) };
+        let (name, url, label, editing) = (form.name.trim(), form.url.trim(), form.label.trim(), form.editing);
         if name.is_empty() || url.is_empty() {
             bail!("name and url are required");
         }
-        if self.connections.iter().any(|c| c.name == name) {
+        let taken = self.connections.iter().enumerate().any(|(i, c)| c.name == name && Some(i) != editing);
+        if taken {
             bail!("a connection named `{name}` already exists");
         }
         driver::family(url)?;
-        let env = (form.env > 0).then(|| ENVS[form.env].to_string());
-        let connection = Connection { name: name.to_string(), url: url.to_string(), env };
-        config::append(&self.dir, &connection)?;
-        self.connections.push(connection);
+        let connection = Connection {
+            name: name.to_string(),
+            url: url.to_string(),
+            label: (!label.is_empty()).then(|| label.to_string()),
+        };
+
+        let Some(i) = editing else {
+            config::append(&self.dir, &connection)?;
+            self.connections.push(connection);
+            self.form = None;
+            return Ok(());
+        };
+        let mut updated = self.connections.clone();
+        let old = std::mem::replace(&mut updated[i], connection);
+        config::save(&self.dir, &updated)?;
+        self.connections = updated;
+        if let Some(at) = self.recent.remove(&old.name) {
+            self.recent.insert(self.connections[i].name.clone(), at);
+            config::save_recent(&self.dir, &self.recent)?;
+        }
         self.form = None;
-        Ok(Action::None)
+        Ok(())
     }
 }
 
-/// Envs in a fixed local, test, prod order with unknown ones after; types alphabetical.
-fn group_rank(grouping: Grouping, group: &str) -> usize {
+/// Labels local, test, prod first, others alphabetical after them; types alphabetical.
+fn label_rank(grouping: Grouping, group: &str) -> usize {
     match grouping {
-        Grouping::Env => ENV_ORDER.iter().position(|env| *env == group).unwrap_or(ENV_ORDER.len() - 1),
-        Grouping::Kind => 0,
+        Grouping::Label => LABEL_ORDER.iter().position(|label| *label == group).unwrap_or(LABEL_ORDER.len()),
+        Grouping::Kind | Grouping::None => 0,
     }
 }
 
@@ -291,8 +375,8 @@ mod tests {
     use super::*;
     use ratatui::crossterm::event::KeyModifiers;
 
-    fn connection(name: &str, url: &str, env: Option<&str>) -> Connection {
-        Connection { name: name.into(), url: url.into(), env: env.map(String::from) }
+    fn connection(name: &str, url: &str, label: Option<&str>) -> Connection {
+        Connection { name: name.into(), url: url.into(), label: label.map(String::from) }
     }
 
     fn picker(test: &str) -> Picker {
@@ -317,34 +401,38 @@ mod tests {
         }
     }
 
-    fn headers(picker: &Picker) -> Vec<String> {
-        let mut headers = Vec::new();
+    fn groups(picker: &Picker) -> Vec<String> {
+        let mut groups = Vec::new();
         for row in picker.rows() {
-            if let ListRow::Header(name, _) = row {
-                headers.push(name);
+            if let ListRow::Group(name) = row {
+                groups.push(name);
             }
         }
-        headers
+        groups
     }
 
     #[test]
-    fn recent_comes_first_then_envs_in_fixed_order() {
+    fn last_opened_first_then_labels_in_fixed_order_newest_first() {
         let picker = picker("order");
-        assert_eq!(headers(&picker), ["Recent", "local", "test", "prod", "other"]);
+        assert_eq!(groups(&picker), ["local", "test", "prod", "other"]);
         assert_eq!(picker.entries(), [0, 2, 2, 1, 3, 0, 4]);
     }
 
     #[test]
-    fn grouping_by_type_and_sorting_by_name() {
+    fn grouping_cycles_and_sort_by_name() {
         let mut picker = picker("grouping");
         press(&mut picker, KeyCode::Char('g'));
+        assert_eq!(groups(&picker), ["beancount", "clickhouse", "mysql", "postgres", "redis"]);
+        press(&mut picker, KeyCode::Char('g'));
         press(&mut picker, KeyCode::Char('s'));
-        assert_eq!(headers(&picker), ["Recent", "beancount", "clickhouse", "mysql", "postgres", "redis"]);
-        assert_eq!(picker.sort, Sort::Name);
+        press(&mut picker, KeyCode::Char('s'));
+        assert_eq!(picker.sort, Sort::NameAsc);
+        assert!(groups(&picker).is_empty());
+        assert_eq!(picker.entries(), [0, 2, 1, 2, 4, 0, 3]);
     }
 
     #[test]
-    fn filter_hides_recent_and_never_matches_passwords() {
+    fn filter_hides_last_opened_and_never_matches_passwords() {
         let mut picker = picker("filter");
         press(&mut picker, KeyCode::Char('/'));
         type_text(&mut picker, "secret");
@@ -352,25 +440,30 @@ mod tests {
         press(&mut picker, KeyCode::Esc);
         press(&mut picker, KeyCode::Char('/'));
         type_text(&mut picker, "example");
-        assert_eq!(headers(&picker), ["test", "prod", "other"]);
+        assert_eq!(groups(&picker), ["test", "prod", "other"]);
         assert_eq!(press(&mut picker, KeyCode::Char('q')), Action::None);
         assert_eq!(picker.filter, "exampleq");
     }
 
     #[test]
-    fn opening_records_last_use() {
+    fn opening_records_last_use_and_x_forgets_it() {
         let mut picker = picker("open");
         press(&mut picker, KeyCode::Char('j'));
         assert_eq!(press(&mut picker, KeyCode::Enter), Action::Connect("main.beancount".into()));
         assert!(picker.last_used(2) > Some(20));
         assert_eq!(picker.entries()[0], 2);
+
+        press(&mut picker, KeyCode::Char('k'));
+        press(&mut picker, KeyCode::Char('x'));
+        assert_eq!(picker.last_used(2), None);
+        assert!(!config::load_recent(&picker.dir).unwrap().contains_key("ledger"));
         std::fs::remove_dir_all(&picker.dir).unwrap();
     }
 
     #[test]
-    fn add_form_validates_and_saves() {
+    fn new_form_validates_and_saves() {
         let mut picker = picker("add");
-        press(&mut picker, KeyCode::Char('a'));
+        press(&mut picker, KeyCode::Char('n'));
         type_text(&mut picker, "cache");
         press(&mut picker, KeyCode::Tab);
         type_text(&mut picker, "sqlite://x.db");
@@ -380,23 +473,49 @@ mod tests {
         press(&mut picker, KeyCode::BackTab);
         type_text(&mut picker, "2");
         press(&mut picker, KeyCode::Up);
-        press(&mut picker, KeyCode::Right);
-        press(&mut picker, KeyCode::Right);
+        type_text(&mut picker, "staging");
         press(&mut picker, KeyCode::Enter);
         assert!(picker.form.is_none());
-        assert_eq!(picker.connections.last(), Some(&connection("cache2", "sqlite://x.db", Some("prod"))));
+        assert_eq!(picker.connections.last(), Some(&connection("cache2", "sqlite://x.db", Some("staging"))));
         assert_eq!(config::load(&picker.dir).unwrap().connections.last(), picker.connections.last());
         std::fs::remove_dir_all(&picker.dir).unwrap();
     }
 
     #[test]
-    fn delete_asks_first_and_forgets_last_use() {
+    fn menu_edit_renames_and_keeps_last_use() {
+        let mut picker = picker("edit");
+        press(&mut picker, KeyCode::Char('m'));
+        press(&mut picker, KeyCode::Enter);
+        assert_eq!(picker.form.as_ref().unwrap().editing, Some(0));
+        type_text(&mut picker, "2");
+        press(&mut picker, KeyCode::Enter);
+        assert_eq!(picker.connections[0].name, "prod-db2");
+        assert_eq!(picker.connections.len(), 5);
+        assert_eq!(picker.last_used(0), Some(20));
+        assert_eq!(config::load(&picker.dir).unwrap().connections, picker.connections);
+        std::fs::remove_dir_all(&picker.dir).unwrap();
+    }
+
+    #[test]
+    fn menu_copies_full_url() {
+        let mut picker = picker("copy");
+        press(&mut picker, KeyCode::Char('m'));
+        press(&mut picker, KeyCode::Char('j'));
+        assert_eq!(press(&mut picker, KeyCode::Enter), Action::Copy("postgres://u:secret@db.example.com/app".into()));
+        assert!(!picker.is_typing());
+    }
+
+    #[test]
+    fn remove_asks_first_and_forgets_last_use() {
         let mut picker = picker("delete");
         press(&mut picker, KeyCode::Char('d'));
         press(&mut picker, KeyCode::Char('n'));
         assert_eq!(picker.connections.len(), 5);
 
-        press(&mut picker, KeyCode::Char('d'));
+        press(&mut picker, KeyCode::Char('m'));
+        press(&mut picker, KeyCode::Char('j'));
+        press(&mut picker, KeyCode::Char('j'));
+        press(&mut picker, KeyCode::Enter);
         assert!(picker.is_typing());
         press(&mut picker, KeyCode::Char('y'));
         assert!(picker.connections.iter().all(|c| c.name != "prod-db"));

@@ -8,7 +8,7 @@ const USAGE: &str = "usage: dbtui [URL | FILE]
     [[connection]]
     name = \"local\"
     url = \"postgres://user:pass@localhost:5432/db\"
-    env = \"prod\"   # optional; localhost and files default to local";
+    label = \"prod\" # optional; localhost and files default to local";
 
 #[tokio::main]
 async fn main() -> Result<()> {

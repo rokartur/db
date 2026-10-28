@@ -23,15 +23,15 @@ pub struct Config {
 pub struct Connection {
     pub name: String,
     pub url: String,
-    /// Set by hand (`prod`, `test`); when unset, `env()` derives it from the URL.
+    /// Free text set by hand (`prod`, `test`); when unset, `label()` derives it from the URL.
     #[serde(default)]
-    pub env: Option<String>,
+    pub label: Option<String>,
 }
 
 impl Connection {
-    pub fn env(&self) -> &str {
-        match &self.env {
-            Some(env) => env,
+    pub fn label(&self) -> &str {
+        match &self.label {
+            Some(label) => label,
             None if self.is_local() => "local",
             None => "other",
         }
@@ -48,6 +48,22 @@ impl Connection {
 
     pub fn redacted_url(&self) -> String {
         driver::redact(&self.url, &driver::secrets_in(&self.url))
+    }
+
+    /// `host:port` and database for the list; a file gives its directory and name. Empty when the URL has no host.
+    pub fn location(&self) -> (String, String) {
+        let secrets = driver::secrets_in(&self.url);
+        let redact = |text: String| driver::redact(&text, &secrets);
+        if file_kind(&self.url).is_some() {
+            let path = Path::new(self.url.split_once("://").map_or(self.url.as_str(), |(_, path)| path));
+            let dir = path.parent().map(|dir| dir.display().to_string()).unwrap_or_default();
+            let file = path.file_name().map(|file| file.to_string_lossy().to_string()).unwrap_or_default();
+            return (redact(dir), redact(file));
+        }
+        let Ok(url) = Url::parse(&self.url) else { return (String::new(), String::new()) };
+        let Some(host) = url.host_str() else { return (String::new(), String::new()) };
+        let host = url.port().map_or(host.to_string(), |port| format!("{host}:{port}"));
+        (redact(host), redact(url.path().trim_start_matches('/').to_string()))
     }
 
     fn is_local(&self) -> bool {
@@ -93,8 +109,8 @@ pub fn save(dir: &Path, connections: &[Connection]) -> Result<()> {
 
 fn block(connection: &Connection) -> String {
     let mut block = format!("\n[[connection]]\nname = {}\nurl = {}\n", quoted(&connection.name), quoted(&connection.url));
-    if let Some(env) = &connection.env {
-        block += &format!("env = {}\n", quoted(env));
+    if let Some(label) = &connection.label {
+        block += &format!("label = {}\n", quoted(label));
     }
     block
 }
@@ -134,24 +150,33 @@ fn read_toml<T: DeserializeOwned + Default>(path: &Path) -> Result<T> {
 mod tests {
     use super::*;
 
-    fn connection(url: &str, env: Option<&str>) -> Connection {
-        Connection { name: "x".into(), url: url.into(), env: env.map(String::from) }
+    fn connection(url: &str, label: Option<&str>) -> Connection {
+        Connection { name: "x".into(), url: url.into(), label: label.map(String::from) }
     }
 
     #[test]
     fn parses_connection_list() {
         let config: Config = toml::from_str("[[connection]]\nname = \"local\"\nurl = \"sqlite://a.db\"\n").unwrap();
         assert_eq!(config.connections[0].url, "sqlite://a.db");
-        assert_eq!(config.connections[0].env, None);
+        assert_eq!(config.connections[0].label, None);
     }
 
     #[test]
-    fn env_is_local_for_files_and_localhost_unless_set() {
-        assert_eq!(connection("a.db", None).env(), "local");
-        assert_eq!(connection("postgres://u:p@localhost:5432/db", None).env(), "local");
-        assert_eq!(connection("redis://127.0.0.1:6379/0", None).env(), "local");
-        assert_eq!(connection("postgres://db.example.com/app", None).env(), "other");
-        assert_eq!(connection("postgres://localhost/app", Some("test")).env(), "test");
+    fn label_is_local_for_files_and_localhost_unless_set() {
+        assert_eq!(connection("a.db", None).label(), "local");
+        assert_eq!(connection("postgres://u:p@localhost:5432/db", None).label(), "local");
+        assert_eq!(connection("redis://127.0.0.1:6379/0", None).label(), "local");
+        assert_eq!(connection("postgres://db.example.com/app", None).label(), "other");
+        assert_eq!(connection("postgres://localhost/app", Some("test")).label(), "test");
+    }
+
+    #[test]
+    fn location_is_host_and_database_without_credentials() {
+        let location = |url: &str| connection(url, None).location();
+        assert_eq!(location("postgresql://admin:pw@10.0.0.1:5433/app?sslmode=require"), ("10.0.0.1:5433".into(), "app".into()));
+        assert_eq!(location("sqlite:///tmp/a.db"), ("/tmp".into(), "a.db".into()));
+        assert_eq!(location("main.beancount"), ("".into(), "main.beancount".into()));
+        assert_eq!(location("odbc:Driver=HDBODBC;Pwd=x"), ("".into(), "".into()));
     }
 
     #[test]
@@ -165,7 +190,7 @@ mod tests {
     fn appended_connections_and_recent_read_back() {
         let dir = std::env::temp_dir().join(format!("dbtui-config-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let tricky = Connection { name: "a \"b\"\nc".into(), url: "postgres://u:p@h/db".into(), env: Some("prod".into()) };
+        let tricky = Connection { name: "a \"b\"\nc".into(), url: "postgres://u:p@h/db".into(), label: Some("prod".into()) };
         append(&dir, &connection("a.db", None)).unwrap();
         append(&dir, &tricky).unwrap();
         assert_eq!(load(&dir).unwrap().connections, vec![connection("a.db", None), tricky]);

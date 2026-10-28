@@ -364,6 +364,9 @@ fn copy(app: &mut App, text: &str) -> Result<()> {
     write!(stdout, "\x1b]52;c;{encoded}\x07")?;
     stdout.flush()?;
     app.status = format!("copied {} chars", text.chars().count());
+    if !driver::secrets_in(text).is_empty() {
+        app.status += ", including a password: clear the clipboard after use";
+    }
     Ok(())
 }
 
