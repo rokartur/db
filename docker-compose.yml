@@ -1,0 +1,133 @@
+# Test databases for tests/live.rs. Run one profile at a time (memory):
+#   docker compose --profile sql up -d && eval "$(scripts/live-env.sh)" && cargo test --test live
+# Host ports are 1xxxx to stay clear of locally running databases.
+name: dbtui
+
+services:
+  postgres:
+    profiles: [sql]
+    image: postgres:17
+    environment: { POSTGRES_PASSWORD: pass }
+    ports: ["15432:5432"]
+  cockroach:
+    profiles: [sql]
+    image: cockroachdb/cockroach:latest
+    command: start-single-node --insecure
+    ports: ["26257:26257"]
+  pglite:
+    profiles: [sql]
+    image: node:22-alpine
+    command: npx -y @electric-sql/pglite-socket --host 0.0.0.0 --port 5432
+    ports: ["15433:5432"]
+  mysql:
+    profiles: [sql]
+    image: mysql:8.4
+    environment: { MYSQL_ROOT_PASSWORD: pass, MYSQL_DATABASE: test }
+    ports: ["13306:3306"]
+  mariadb:
+    profiles: [sql]
+    image: mariadb:11
+    environment: { MARIADB_ROOT_PASSWORD: pass, MARIADB_DATABASE: test }
+    ports: ["13307:3306"]
+  tidb:
+    profiles: [sql]
+    image: pingcap/tidb:latest
+    ports: ["14000:4000"]
+  databend:
+    profiles: [sql]
+    image: datafuselabs/databend:latest
+    environment: { QUERY_DEFAULT_USER: databend, QUERY_DEFAULT_PASSWORD: databend }
+    ports: ["13308:3307"]
+  mssql:
+    profiles: [sql]
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    platform: linux/amd64
+    environment: { ACCEPT_EULA: "Y", MSSQL_SA_PASSWORD: "Passw0rd!x" }
+    ports: ["11433:1433"]
+  libsql:
+    profiles: [sql]
+    image: ghcr.io/tursodatabase/libsql-server:latest
+    ports: ["18082:8080"]
+  oceanbase:
+    profiles: [heavy]
+    image: oceanbase/oceanbase-ce:latest
+    environment: { MODE: mini }
+    ports: ["12881:2881"]
+
+  clickhouse:
+    profiles: [analytics]
+    image: clickhouse/clickhouse-server:latest
+    environment: { CLICKHOUSE_USER: default, CLICKHOUSE_PASSWORD: pass, CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1" }
+    ports: ["18123:8123"]
+  trino:
+    profiles: [analytics]
+    image: trinodb/trino:latest
+    ports: ["18080:8080"]
+  bigquery:
+    profiles: [analytics]
+    image: ghcr.io/goccy/bigquery-emulator:latest
+    platform: linux/amd64
+    command: --project=test --dataset=ds
+    ports: ["19050:9050"]
+  spanner:
+    profiles: [analytics]
+    image: gcr.io/cloud-spanner-emulator/emulator:latest
+    ports: ["19020:9020"]
+
+  mongo:
+    profiles: [nosql]
+    image: mongo:8
+    ports: ["27018:27017"]
+  surrealdb:
+    profiles: [nosql]
+    image: surrealdb/surrealdb:latest
+    command: start --user root --pass root memory
+    ports: ["18000:8000"]
+  redis:
+    profiles: [nosql]
+    image: redis:8
+    ports: ["16379:6379"]
+  dynamodb:
+    profiles: [nosql]
+    image: amazon/dynamodb-local:latest
+    ports: ["18001:8000"]
+  cassandra:
+    profiles: [nosql]
+    image: cassandra:5
+    environment: { MAX_HEAP_SIZE: 512M, HEAP_NEWSIZE: 128M }
+    ports: ["19042:9042"]
+  scylla:
+    profiles: [nosql]
+    image: scylladb/scylla:latest
+    command: --smp 1 --memory 750M --overprovisioned 1 --developer-mode 1
+    ports: ["19043:9042"]
+
+  elasticsearch:
+    profiles: [search]
+    image: elasticsearch:8.15.3
+    environment: { discovery.type: single-node, xpack.security.enabled: "false", ES_JAVA_OPTS: -Xms512m -Xmx512m }
+    ports: ["19200:9200"]
+  typesense:
+    profiles: [search]
+    image: typesense/typesense:27.1
+    command: --data-dir /tmp --api-key=xyz
+    ports: ["18108:8108"]
+  weaviate:
+    profiles: [search]
+    image: semitechnologies/weaviate:1.26.6
+    environment:
+      AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: "true"
+      PERSISTENCE_DATA_PATH: /var/lib/weaviate
+      DEFAULT_VECTORIZER_MODULE: none
+      CLUSTER_HOSTNAME: node1
+    ports: ["18081:8080"]
+
+  kafka:
+    profiles: [stream]
+    image: apache/kafka:3.9.0
+    ports: ["9092:9092"]
+  etcd:
+    profiles: [stream]
+    image: quay.io/coreos/etcd:v3.5.17
+    command: etcd --listen-client-urls http://0.0.0.0:2379 --advertise-client-urls http://localhost:2379
+    ports: ["12379:2379"]
