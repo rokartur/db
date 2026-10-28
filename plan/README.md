@@ -62,6 +62,7 @@ Drivery nie-SQL implementują wszystkie trzy metody.
 | 8 | Streaming: Kafka, etcd | [08-streaming.md](08-streaming.md) |
 | 9 | Beancount: parser + BQL | [09-beancount.md](09-beancount.md) |
 | 10 | Weryfikacja: docker-compose, testy live, przegląd bezpieczeństwa | [10-weryfikacja.md](10-weryfikacja.md) |
+| 11 | UI jak Tamery: ekran połączeń, widok bazy, sort i filtry, edycja | [11-tamery.md](11-tamery.md) |
 
 Mapa 40 baz na drivery, URL-e i sposób testu: [bazy.md](bazy.md).
 
