@@ -1,6 +1,6 @@
-use crate::config::Connection;
 use crate::driver::{self, Driver, Grid, Group, PAGE};
 use crate::editor::Editor;
+use crate::picker::Picker;
 use crate::ui;
 use anyhow::Result;
 use base64::Engine;
@@ -54,9 +54,10 @@ pub enum Action {
 }
 
 pub struct App {
-    pub connections: Vec<Connection>,
-    /// Cursor in the connection list; `Some` while no database is open.
-    pub picker: Option<usize>,
+    pub picker: Picker,
+    /// The connection list is on screen: full screen until a database opens, a popup (Ctrl-P) after.
+    pub palette: bool,
+    pub connected: bool,
     pub groups: Vec<Group>,
     pub expanded: Vec<bool>,
     pub tree_cursor: usize,
@@ -74,10 +75,11 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(connections: Vec<Connection>) -> Self {
+    pub fn new(picker: Picker) -> Self {
         App {
-            connections,
-            picker: Some(0),
+            picker,
+            palette: true,
+            connected: false,
             groups: Vec::new(),
             expanded: Vec::new(),
             tree_cursor: 0,
@@ -126,7 +128,11 @@ impl App {
         self.groups = groups;
         self.tree_cursor = 0;
         self.opened = None;
-        self.picker = None;
+        self.page = 0;
+        self.records = TableView::default();
+        self.result = TableView::default();
+        self.palette = false;
+        self.connected = true;
         self.status = format!("connected: {} groups", self.groups.len());
     }
 
@@ -143,8 +149,27 @@ impl App {
             self.help = false;
             return Action::None;
         }
-        if let Some(cursor) = self.picker {
-            return self.picker_key(cursor, key);
+        if self.palette && !self.picker.is_typing() && key.code == KeyCode::Char('?') {
+            self.help = true;
+            return Action::None;
+        }
+        if self.palette {
+            return match self.picker.handle_key(key) {
+                Ok(Action::Quit) if self.connected => {
+                    self.palette = false;
+                    Action::None
+                }
+                Ok(action) => action,
+                Err(error) => {
+                    self.fail(error);
+                    Action::None
+                }
+            };
+        }
+        if ctrl && key.code == KeyCode::Char('p') {
+            self.picker.open_palette();
+            self.palette = true;
+            return Action::None;
         }
         let run = (ctrl && key.code == KeyCode::Char('r')) || key.code == KeyCode::F(5);
         if run {
@@ -187,21 +212,6 @@ impl App {
             KeyCode::Char('l') | KeyCode::Right => self.move_column(1),
             KeyCode::Char('h') | KeyCode::Left => self.move_column(-1),
             KeyCode::Enter if self.focus == Focus::Tree => return self.open_node(),
-            _ => {}
-        }
-        Action::None
-    }
-
-    fn picker_key(&mut self, cursor: usize, key: KeyEvent) -> Action {
-        match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => return Action::Quit,
-            KeyCode::Char('j') | KeyCode::Down => self.picker = Some(step(cursor, 1, self.connections.len())),
-            KeyCode::Char('k') | KeyCode::Up => self.picker = Some(step(cursor, -1, self.connections.len())),
-            KeyCode::Enter => {
-                if let Some(connection) = self.connections.get(cursor) {
-                    return Action::Connect(connection.url.clone());
-                }
-            }
             _ => {}
         }
         Action::None
@@ -264,22 +274,22 @@ impl App {
     }
 }
 
-fn step(value: usize, delta: isize, len: usize) -> usize {
+pub(crate) fn step(value: usize, delta: isize, len: usize) -> usize {
     if len == 0 {
         return 0;
     }
     value.saturating_add_signed(delta).min(len - 1)
 }
 
-pub async fn run(url: Option<String>, connections: Vec<Connection>) -> Result<()> {
+pub async fn run(url: Option<String>, picker: Picker) -> Result<()> {
     let mut terminal = ratatui::init();
-    let outcome = event_loop(&mut terminal, url, connections).await;
+    let outcome = event_loop(&mut terminal, url, picker).await;
     ratatui::restore();
     outcome
 }
 
-async fn event_loop(terminal: &mut DefaultTerminal, url: Option<String>, connections: Vec<Connection>) -> Result<()> {
-    let mut app = App::new(connections);
+async fn event_loop(terminal: &mut DefaultTerminal, url: Option<String>, picker: Picker) -> Result<()> {
+    let mut app = App::new(picker);
     let mut db: Option<Box<dyn Driver>> = None;
     if let Some(url) = url {
         connect(terminal, &mut app, &mut db, &url).await?;
@@ -361,13 +371,17 @@ fn copy(app: &mut App, text: &str) -> Result<()> {
 mod tests {
     use super::*;
 
+    fn app() -> App {
+        App::new(Picker::new(std::path::PathBuf::new(), Vec::new(), Default::default()))
+    }
+
     fn press(app: &mut App, code: KeyCode) -> Action {
         app.handle_key(KeyEvent::new(code, KeyModifiers::NONE))
     }
 
     #[test]
     fn tree_opens_items_and_pages_records() {
-        let mut app = App::new(Vec::new());
+        let mut app = app();
         app.connected("sqlite://x.db", vec![Group { name: "main".into(), items: vec!["a".into(), "b".into()] }]);
         assert_eq!(app.nodes().len(), 3);
         press(&mut app, KeyCode::Char('j'));
@@ -385,7 +399,7 @@ mod tests {
 
     #[test]
     fn q_types_into_the_editor_instead_of_quitting() {
-        let mut app = App::new(Vec::new());
+        let mut app = app();
         app.connected("sqlite://x.db", Vec::new());
         press(&mut app, KeyCode::Char('2'));
         press(&mut app, KeyCode::Char('e'));
@@ -396,8 +410,27 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_p_opens_the_palette_and_esc_closes_it_once_connected() {
+        let mut app = app();
+        assert!(app.palette);
+        press(&mut app, KeyCode::Char('?'));
+        assert!(app.help);
+        press(&mut app, KeyCode::Esc);
+        app.connected("sqlite://x.db", Vec::new());
+        assert!(!app.palette);
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        assert!(app.palette && app.picker.filtering);
+        assert_eq!(press(&mut app, KeyCode::Char('q')), Action::None);
+        assert_eq!(app.picker.filter, "q");
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(press(&mut app, KeyCode::Esc), Action::None);
+        assert!(!app.palette);
+        assert_eq!(press(&mut app, KeyCode::Char('q')), Action::Quit);
+    }
+
+    #[test]
     fn errors_hide_secrets() {
-        let mut app = App::new(Vec::new());
+        let mut app = app();
         app.connected("d1://acct/db?token=abc123", Vec::new());
         app.fail(anyhow::anyhow!("rejected token abc123"));
         assert_eq!(app.status, "error: rejected token ***");

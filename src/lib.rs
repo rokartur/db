@@ -3,4 +3,5 @@ pub mod beancount;
 pub mod config;
 pub mod driver;
 pub mod editor;
+pub mod picker;
 pub mod ui;
