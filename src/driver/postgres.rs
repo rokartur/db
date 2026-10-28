@@ -12,11 +12,25 @@ pub struct Postgres {
 impl Postgres {
     pub async fn connect(url: &str) -> Result<Self> {
         let (_, rest) = url.split_once("://").unwrap_or(("", url));
-        let tls = MakeTlsConnector::new(native_tls::TlsConnector::new()?);
-        let (client, connection) = tokio_postgres::connect(&format!("postgres://{rest}"), tls).await?;
+        let mode = ssl_mode(rest);
+        // tokio-postgres only parses disable/prefer/require; verification is done by the connector below.
+        let verify = matches!(mode, "verify-ca" | "verify-full");
+        let rest = if verify { rest.replace(&format!("sslmode={mode}"), "sslmode=require") } else { rest.to_string() };
+        let tls = native_tls::TlsConnector::builder()
+            .danger_accept_invalid_certs(!verify)
+            .danger_accept_invalid_hostnames(mode != "verify-full")
+            .build()?;
+        let (client, connection) = tokio_postgres::connect(&format!("postgres://{rest}"), MakeTlsConnector::new(tls)).await?;
         tokio::spawn(connection);
         Ok(Postgres { client })
     }
+}
+
+/// libpq semantics: `prefer` (the default) and `require` encrypt without checking the certificate,
+/// `verify-ca` checks the chain, `verify-full` also the hostname.
+fn ssl_mode(rest: &str) -> &str {
+    let query = rest.split_once('?').map_or("", |(_, query)| query);
+    query.split('&').find_map(|pair| pair.strip_prefix("sslmode=")).unwrap_or("prefer")
 }
 
 #[async_trait]
